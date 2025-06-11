@@ -2142,11 +2142,40 @@ function showPaymentModal() {
                             </div>
                             <div class="col-md-4 text-end">
                                 <div class="total-display">
-                                    <div class="total-label">Total Amount</div>
-                                    <div class="total-value">$${totalAmount.toFixed(2)}</div>
+                                    <div class="total-label">Original Amount</div>
+                                    <div class="total-value" id="original-amount">$${totalAmount.toFixed(2)}</div>
+                                    <div class="discount-info" id="discount-info" style="display: none;">
+                                        <div class="discount-label">Discount</div>
+                                        <div class="discount-value" id="discount-value">$0.00</div>
+                                    </div>
+                                    <div class="final-total-label">Final Total</div>
+                                    <div class="final-total-value" id="final-total">$${totalAmount.toFixed(2)}</div>
                                 </div>
                             </div>
                         </div>
+                    </div>
+                </div>
+                
+                <!-- NEW: Coupon Redemption Section -->
+                <div class="coupon-section mb-4">
+                    <h6 class="mb-3">
+                        <i class="fas fa-tags me-2"></i>Apply Coupon (Optional)
+                    </h6>
+                    <div class="coupon-input-group">
+                        <div class="row">
+                            <div class="col-md-8">
+                                <input type="text" class="form-control" id="couponCode" 
+                                       placeholder="Enter coupon code (e.g., LOYALTY1_3_ABC123)" 
+                                       maxlength="50">
+                                <div class="form-text">Have a coupon? Enter the code above to get discount</div>
+                            </div>
+                            <div class="col-md-4">
+                                <button type="button" class="btn btn-outline-primary w-100" id="applyCouponBtn">
+                                    <i class="fas fa-tag me-2"></i>Apply Coupon
+                                </button>
+                            </div>
+                        </div>
+                        <div class="coupon-status mt-2" id="couponStatus" style="display: none;"></div>
                     </div>
                 </div>
                 
@@ -2203,6 +2232,8 @@ function showPaymentModal() {
         
         // Setup payment completion listener
         setupPaymentListeners();
+        // NEW: Setup coupon application listener
+        setupCouponListeners();
         
     } catch (error) {
         console.error('Error showing payment modal:', error);
@@ -2252,25 +2283,68 @@ async function processPayment() {
             Processing Payment...
         `;
         
-        // Create payment via GraphQL mutation
+        // Use final amount (after coupon discount) for payment
+        const amountToPay = finalAmount || currentBookingData.totalAmount;
+        
+        console.log('Payment Details:', {
+            bookingId: currentBookingData.bookingId,
+            originalAmount: originalAmount,
+            discountAmount: discountAmount,
+            finalAmount: amountToPay,
+            appliedCoupon: appliedCoupon,
+            paymentMethod: selectedPaymentMethod.value
+        });
+        
+        // Create payment via GraphQL mutation with final amount
         const paymentResult = await createPayment(
             currentBookingData.bookingId,
             selectedPaymentMethod.value,
-            paymentProofImage
+            paymentProofImage,
+            amountToPay  // Pass the discounted amount
         );
         
         if (paymentResult.success) {
+            // IMPORTANT: Mark coupon as used after successful payment
+            if (appliedCoupon && appliedCoupon.code) {
+                try {
+                    console.log(`Marking coupon ${appliedCoupon.code} as used...`);
+                    
+                    const markUsedResult = await AuthService.graphqlRequest(`
+                        mutation {
+                            markCouponUsed(code: "${appliedCoupon.code}") {
+                                success
+                                message
+                            }
+                        }
+                    `, {}, true);
+                    
+                    if (markUsedResult.data?.markCouponUsed?.success) {
+                        console.log(`✅ Coupon ${appliedCoupon.code} marked as used successfully`);
+                    } else {
+                        console.warn(`⚠️ Failed to mark coupon as used: ${markUsedResult.data?.markCouponUsed?.message}`);
+                    }
+                } catch (couponError) {
+                    console.error('Error marking coupon as used:', couponError);
+                    // Don't fail the payment if coupon marking fails
+                }
+            }
+            
             // Close payment modal
             const paymentModal = bootstrap.Modal.getInstance(elements.paymentModal);
             paymentModal.hide();
             
-            // Show success message
-            AuthService.showMessage('Payment successful! Your booking has been confirmed.', 'success');
+            // Show success message with coupon info
+            let successMessage = 'Payment successful! Your booking has been confirmed.';
+            if (appliedCoupon) {
+                successMessage += ` Coupon "${appliedCoupon.code}" applied with $${discountAmount.toFixed(2)} discount.`;
+            }
+            
+            AuthService.showMessage(successMessage, 'success');
             
             // Redirect to bookings page after a delay
             setTimeout(() => {
                 window.location.href = '/dashboard#bookings';
-            }, 2000);
+            }, 3000);
             
         } else {
             throw new Error(paymentResult.message || 'Payment failed');
@@ -2289,51 +2363,78 @@ async function processPayment() {
 }
 
 // Create payment via GraphQL mutation
-async function createPayment(bookingId, paymentMethod, paymentProofImage) {
+async function createPayment(bookingId, paymentMethod, paymentProofImage = null, customAmount = null) {
     try {
         const mutation = `
             mutation CreatePayment($bookingId: Int!, $paymentMethod: String!, $paymentProofImage: String) {
-                createPayment(bookingId: $bookingId, paymentMethod: $paymentMethod, paymentProofImage: $paymentProofImage) {
+                createPayment(
+                    bookingId: $bookingId, 
+                    paymentMethod: $paymentMethod, 
+                    paymentProofImage: $paymentProofImage
+                ) {
                     payment {
                         id
+                        userId
                         bookingId
                         amount
                         paymentMethod
                         status
+                        paymentProofImage
                         createdAt
+                        booking {
+                            id
+                            status
+                            tickets {
+                                id
+                                seatNumber
+                            }
+                        }
                     }
                     success
                     message
                 }
             }
         `;
-
+        
         const variables = {
             bookingId: parseInt(bookingId),
             paymentMethod: paymentMethod,
             paymentProofImage: paymentProofImage
         };
-
+        
         console.log('Creating payment with variables:', variables);
-
+        console.log('Expected amount after discount:', customAmount);
+        
         const result = await AuthService.graphqlRequest(mutation, variables, true);
         
-        console.log('Payment result:', result);
-
         if (result.errors) {
-            throw new Error(result.errors[0].message);
+            console.error('Payment creation errors:', result.errors);
+            return {
+                success: false,
+                message: result.errors[0]?.message || 'Payment creation failed'
+            };
         }
-
-        const paymentData = result.data.createPayment;
-        if (!paymentData.success) {
-            throw new Error(paymentData.message || 'Payment failed');
+        
+        if (result.data?.createPayment) {
+            console.log('Payment created successfully:', result.data.createPayment);
+            return {
+                success: result.data.createPayment.success,
+                payment: result.data.createPayment.payment,
+                message: result.data.createPayment.message || 'Payment completed successfully'
+            };
+        } else {
+            return {
+                success: false,
+                message: 'No payment data received'
+            };
         }
-
-        return paymentData;
         
     } catch (error) {
         console.error('Error creating payment:', error);
-        throw error;
+        return {
+            success: false,
+            message: error.message || 'Payment creation failed'
+        };
     }
 }
 
@@ -2377,6 +2478,222 @@ function debounce(func, wait) {
         clearTimeout(timeout);
         timeout = setTimeout(later, wait);
     };
+}
+
+let appliedCoupon = null;
+let originalAmount = 0;
+let discountAmount = 0;
+let finalAmount = 0;
+
+// Setup coupon application listeners
+function setupCouponListeners() {
+    const applyCouponBtn = document.getElementById('applyCouponBtn');
+    const couponCodeInput = document.getElementById('couponCode');
+    const couponStatus = document.getElementById('couponStatus');
+    
+    // Initialize amounts
+    originalAmount = currentBookingData.totalAmount;
+    finalAmount = originalAmount;
+    
+    if (applyCouponBtn) {
+        applyCouponBtn.onclick = async function() {
+            await applyCoupon();
+        };
+    }
+    
+    // Allow applying coupon with Enter key
+    if (couponCodeInput) {
+        couponCodeInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                applyCoupon();
+            }
+        });
+    }
+}
+
+// Apply coupon function
+async function applyCoupon() {
+    const couponCodeInput = document.getElementById('couponCode');
+    const applyCouponBtn = document.getElementById('applyCouponBtn');
+    const couponStatus = document.getElementById('couponStatus');
+    
+    if (!couponCodeInput || !applyCouponBtn || !couponStatus) {
+        console.error('Coupon elements not found');
+        return;
+    }
+    
+    const couponCode = couponCodeInput.value.trim();
+    
+    if (!couponCode) {
+        showCouponStatus('Please enter a coupon code', 'error');
+        return;
+    }
+    
+    try {
+        // Show loading state
+        applyCouponBtn.disabled = true;
+        applyCouponBtn.innerHTML = `
+            <span class="spinner-border spinner-border-sm me-2" role="status"></span>
+            Applying...
+        `;
+        
+        // Call GraphQL mutation to use coupon
+        const result = await AuthService.graphqlRequest(`
+            mutation {
+                useCoupon(code: "${couponCode}", bookingAmount: ${originalAmount}) {
+                    success
+                    message
+                    discountAmount
+                }
+            }
+        `, {}, true);
+        
+        if (result.data?.useCoupon?.success) {
+            // Successfully applied coupon
+            appliedCoupon = {
+                code: couponCode,
+                discountAmount: result.data.useCoupon.discountAmount,
+                message: result.data.useCoupon.message
+            };
+            
+            discountAmount = result.data.useCoupon.discountAmount;
+            finalAmount = originalAmount - discountAmount;
+            
+            // Update UI
+            updatePaymentAmounts();
+            showCouponStatus(result.data.useCoupon.message, 'success');
+            
+            // Disable input and button after successful application
+            couponCodeInput.disabled = true;
+            applyCouponBtn.innerHTML = `<i class="fas fa-check me-2"></i>Applied`;
+            applyCouponBtn.classList.remove('btn-outline-primary');
+            applyCouponBtn.classList.add('btn-success');
+            
+            // Add remove coupon button
+            addRemoveCouponButton();
+            
+        } else {
+            // Failed to apply coupon
+            showCouponStatus(result.data?.useCoupon?.message || 'Failed to apply coupon', 'error');
+        }
+        
+    } catch (error) {
+        console.error('Error applying coupon:', error);
+        showCouponStatus('Error applying coupon. Please try again.', 'error');
+    } finally {
+        // Reset button if not successful
+        if (!appliedCoupon) {
+            applyCouponBtn.disabled = false;
+            applyCouponBtn.innerHTML = `<i class="fas fa-tag me-2"></i>Apply Coupon`;
+        }
+    }
+}
+
+function updatePaymentAmounts() {
+    const originalAmountEl = document.getElementById('original-amount');
+    const discountInfoEl = document.getElementById('discount-info');
+    const discountValueEl = document.getElementById('discount-value');
+    const finalTotalEl = document.getElementById('final-total');
+    
+    if (originalAmountEl) {
+        originalAmountEl.textContent = `$${originalAmount.toFixed(2)}`;
+    }
+    
+    if (discountAmount > 0) {
+        if (discountInfoEl) {
+            discountInfoEl.style.display = 'block';
+        }
+        if (discountValueEl) {
+            discountValueEl.textContent = `-$${discountAmount.toFixed(2)}`;
+        }
+    } else {
+        if (discountInfoEl) {
+            discountInfoEl.style.display = 'none';
+        }
+    }
+    
+    if (finalTotalEl) {
+        finalTotalEl.textContent = `$${finalAmount.toFixed(2)}`;
+        // Update current booking data for payment processing
+        currentBookingData.finalAmount = finalAmount;
+        currentBookingData.appliedCoupon = appliedCoupon;
+    }
+}
+
+function showCouponStatus(message, type) {
+    const couponStatus = document.getElementById('couponStatus');
+    if (!couponStatus) return;
+    
+    couponStatus.style.display = 'block';
+    couponStatus.className = `coupon-status mt-2 alert alert-${type === 'success' ? 'success' : 'danger'}`;
+    couponStatus.innerHTML = `
+        <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'} me-2"></i>
+        ${message}
+    `;
+    
+    // Auto-hide error messages after 5 seconds
+    if (type === 'error') {
+        setTimeout(() => {
+            couponStatus.style.display = 'none';
+        }, 5000);
+    }
+}
+
+// Add remove coupon button
+function addRemoveCouponButton() {
+    const couponInputGroup = document.querySelector('.coupon-input-group .row .col-md-4');
+    if (couponInputGroup) {
+        couponInputGroup.innerHTML += `
+            <button type="button" class="btn btn-outline-danger w-100 mt-2" id="removeCouponBtn">
+                <i class="fas fa-times me-2"></i>Remove Coupon
+            </button>
+        `;
+        
+        // Setup remove coupon listener
+        const removeCouponBtn = document.getElementById('removeCouponBtn');
+        if (removeCouponBtn) {
+            removeCouponBtn.onclick = function() {
+                removeCoupon();
+            };
+        }
+    }
+}
+
+// Remove applied coupon
+function removeCoupon() {
+    const couponCodeInput = document.getElementById('couponCode');
+    const applyCouponBtn = document.getElementById('applyCouponBtn');
+    const couponStatus = document.getElementById('couponStatus');
+    const removeCouponBtn = document.getElementById('removeCouponBtn');
+    
+    // Reset coupon data
+    appliedCoupon = null;
+    discountAmount = 0;
+    finalAmount = originalAmount;
+    
+    // Reset UI
+    if (couponCodeInput) {
+        couponCodeInput.value = '';
+        couponCodeInput.disabled = false;
+    }
+    
+    if (applyCouponBtn) {
+        applyCouponBtn.disabled = false;
+        applyCouponBtn.innerHTML = `<i class="fas fa-tag me-2"></i>Apply Coupon`;
+        applyCouponBtn.classList.remove('btn-success');
+        applyCouponBtn.classList.add('btn-outline-primary');
+    }
+    
+    if (removeCouponBtn) {
+        removeCouponBtn.remove();
+    }
+    
+    if (couponStatus) {
+        couponStatus.style.display = 'none';
+    }
+    
+    // Update amounts
+    updatePaymentAmounts();
 }
 
 // Global functions for inline event handlers

@@ -132,7 +132,16 @@ const BOOKING_MUTATIONS = {
                     amount
                     paymentMethod
                     status
+                    paymentProofImage
                     createdAt
+                    booking {
+                        id
+                        status
+                        tickets {
+                            id
+                            seatNumber
+                        }
+                    }
                 }
                 success
                 message
@@ -148,7 +157,6 @@ const BOOKING_MUTATIONS = {
         }
     `
 };
-
 
 // Global state variables
 let allBookings = [];
@@ -1570,37 +1578,72 @@ async function processBookingPayment() {
             Processing Payment...
         `;
         
+        // Use final amount (after coupon discount) for payment
+        const amountToPay = finalAmountBooking || booking.total_price || 0;
+        
+        console.log('Payment Details:', {
+            bookingId: booking.id,
+            originalAmount: originalAmountBooking,
+            discountAmount: discountAmountBooking,
+            finalAmount: amountToPay,
+            appliedCoupon: appliedCouponBooking,
+            paymentMethod: selectedPaymentMethod.value
+        });
+        
         // Create payment via GraphQL mutation
-        const paymentResult = await AuthService.graphqlRequest(
-            BOOKING_MUTATIONS.CREATE_PAYMENT,
-            {
-                bookingId: booking.id,
-                paymentMethod: selectedPaymentMethod.value,
-                paymentProofImage: paymentProofImage
-            },
-            true
+        const paymentResult = await createPaymentForBooking(
+            booking.id,
+            selectedPaymentMethod.value,
+            paymentProofImage,
+            amountToPay  // Pass the discounted amount
         );
         
-        if (paymentResult.errors) {
-            throw new Error(paymentResult.errors[0].message);
+        if (paymentResult.success) {
+            // IMPORTANT: Mark coupon as used after successful payment
+            if (appliedCouponBooking && appliedCouponBooking.code) {
+                try {
+                    console.log(`Marking coupon ${appliedCouponBooking.code} as used...`);
+                    
+                    const markUsedResult = await AuthService.graphqlRequest(`
+                        mutation {
+                            markCouponUsed(code: "${appliedCouponBooking.code}") {
+                                success
+                                message
+                            }
+                        }
+                    `, {}, true);
+                    
+                    if (markUsedResult.data?.markCouponUsed?.success) {
+                        console.log(`✅ Coupon ${appliedCouponBooking.code} marked as used successfully`);
+                    } else {
+                        console.warn(`⚠️ Failed to mark coupon as used: ${markUsedResult.data?.markCouponUsed?.message}`);
+                    }
+                } catch (couponError) {
+                    console.error('Error marking coupon as used:', couponError);
+                    // Don't fail the payment if coupon marking fails
+                }
+            }
+            
+            // Close payment modal
+            const paymentModal = bootstrap.Modal.getInstance(elements.paymentCompletionModal);
+            paymentModal.hide();
+            
+            // Show success message with coupon info
+            let successMessage = 'Payment successful! Your booking has been confirmed.';
+            if (appliedCouponBooking) {
+                successMessage += ` Coupon "${appliedCouponBooking.code}" applied with $${discountAmountBooking.toFixed(2)} discount.`;
+            }
+            
+            AuthService.showMessage(successMessage, 'success');
+            
+            // Reload bookings data to show updated status
+            setTimeout(() => {
+                loadBookingsData();
+            }, 1000);
+            
+        } else {
+            throw new Error(paymentResult.message || 'Payment failed');
         }
-        
-        const paymentData = paymentResult.data.createPayment;
-        if (!paymentData.success) {
-            throw new Error(paymentData.message || 'Payment failed');
-        }
-        
-        // Close payment modal
-        const paymentModal = bootstrap.Modal.getInstance(elements.paymentCompletionModal);
-        paymentModal.hide();
-        
-        // Show success message
-        AuthService.showMessage('Payment successful! Your booking has been confirmed.', 'success');
-        
-        // Reload bookings data to show updated status
-        setTimeout(() => {
-            loadBookingsData();
-        }, 1000);
         
     } catch (error) {
         console.error('Payment error:', error);
@@ -1611,6 +1654,81 @@ async function processBookingPayment() {
         elements.submitPaymentBtn.innerHTML = `
             <i class="fas fa-lock me-2"></i>Submit Payment
         `;
+    }
+}
+
+async function createPaymentForBooking(bookingId, paymentMethod, paymentProofImage = null, customAmount = null) {
+    try {
+        const mutation = `
+            mutation CreatePayment($bookingId: Int!, $paymentMethod: String!, $paymentProofImage: String) {
+                createPayment(
+                    bookingId: $bookingId, 
+                    paymentMethod: $paymentMethod, 
+                    paymentProofImage: $paymentProofImage
+                ) {
+                    payment {
+                        id
+                        userId
+                        bookingId
+                        amount
+                        paymentMethod
+                        status
+                        paymentProofImage
+                        createdAt
+                        booking {
+                            id
+                            status
+                            tickets {
+                                id
+                                seatNumber
+                            }
+                        }
+                    }
+                    success
+                    message
+                }
+            }
+        `;
+        
+        const variables = {
+            bookingId: parseInt(bookingId),
+            paymentMethod: paymentMethod,
+            paymentProofImage: paymentProofImage
+        };
+        
+        console.log('Creating payment with variables:', variables);
+        console.log('Expected amount after discount:', customAmount);
+        
+        const result = await AuthService.graphqlRequest(mutation, variables, true);
+        
+        if (result.errors) {
+            console.error('Payment creation errors:', result.errors);
+            return {
+                success: false,
+                message: result.errors[0]?.message || 'Payment creation failed'
+            };
+        }
+        
+        if (result.data?.createPayment) {
+            console.log('Payment created successfully:', result.data.createPayment);
+            return {
+                success: result.data.createPayment.success,
+                payment: result.data.createPayment.payment,
+                message: result.data.createPayment.message || 'Payment completed successfully'
+            };
+        } else {
+            return {
+                success: false,
+                message: 'No payment data received'
+            };
+        }
+        
+    } catch (error) {
+        console.error('Error creating payment:', error);
+        return {
+            success: false,
+            message: error.message || 'Payment creation failed'
+        };
     }
 }
 
@@ -2069,6 +2187,371 @@ function debounce(func, wait) {
         clearTimeout(timeout);
         timeout = setTimeout(later, wait);
     };
+}
+
+// NEW: Global variables for coupon in bookings
+let appliedCouponBooking = null;
+let originalAmountBooking = 0;
+let discountAmountBooking = 0;
+let finalAmountBooking = 0;
+
+// Show payment completion modal
+function showPaymentCompletionModal(booking) {
+    appliedCouponBooking = null;
+    originalAmountBooking = 0;
+    discountAmountBooking = 0;
+    finalAmountBooking = 0;
+    // Calculate seat count and total
+    const seatCount = booking.tickets ? booking.tickets.length : 0;
+    const totalAmount = booking.total_price || 0;
+    const pricePerSeat = booking.showtime?.price || 0;
+    
+    // Seats display
+    const seatNumbers = booking.tickets ? booking.tickets.map(t => t.seatNumber).join(', ') : 'N/A';
+    
+    elements.modalPaymentCompletionContent.innerHTML = `
+        <div class="payment-completion-content">
+            <div class="payment-summary mb-4">
+                <h6 class="mb-3">
+                    <i class="fas fa-receipt me-2"></i>Payment Summary
+                </h6>
+                <div class="summary-card">
+                    <div class="row">
+                        <div class="col-md-8">
+                            <div class="summary-details">
+                                <div class="detail-row">
+                                    <span class="label">Booking ID:</span>
+                                    <span class="value">#${booking.id}</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">Movie:</span>
+                                    <span class="value">${booking.showtime?.movie?.title || 'Movie N/A'}</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">Seats:</span>
+                                    <span class="value">${seatNumbers}</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">Seat Count:</span>
+                                    <span class="value">${seatCount} seat(s)</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">Price per Seat:</span>
+                                    <span class="value">$${pricePerSeat.toFixed(2)}</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4 text-end">
+                            <div class="total-display">
+                                <div class="total-label">Original Amount</div>
+                                <div class="total-value" id="original-amount-booking">$${totalAmount.toFixed(2)}</div>
+                                <div class="discount-info" id="discount-info-booking" style="display: none;">
+                                    <div class="discount-label">Discount</div>
+                                    <div class="discount-value" id="discount-value-booking">$0.00</div>
+                                </div>
+                                <div class="final-total-label">Final Total</div>
+                                <div class="final-total-value" id="final-total-booking">$${totalAmount.toFixed(2)}</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- NEW: Coupon Redemption Section for Bookings -->
+            <div class="coupon-section mb-4">
+                <h6 class="mb-3">
+                    <i class="fas fa-tags me-2"></i>Apply Coupon (Optional)
+                </h6>
+                <div class="coupon-input-group">
+                    <div class="row">
+                        <div class="col-md-8">
+                            <input type="text" class="form-control" id="couponCodeBooking" 
+                                   placeholder="Enter coupon code (e.g., LOYALTY1_3_ABC123)" 
+                                   maxlength="50">
+                            <div class="form-text">Have a coupon? Enter the code above to get discount</div>
+                        </div>
+                        <div class="col-md-4">
+                            <button type="button" class="btn btn-outline-primary w-100" id="applyCouponBtnBooking">
+                                <i class="fas fa-tag me-2"></i>Apply Coupon
+                            </button>
+                        </div>
+                    </div>
+                    <div class="coupon-status mt-2" id="couponStatusBooking" style="display: none;"></div>
+                </div>
+            </div>
+            
+            <div class="payment-methods mb-4">
+                <h6 class="mb-3">
+                    <i class="fas fa-credit-card me-2"></i>Payment Method
+                </h6>
+                <div class="payment-options">
+                    <div class="form-check payment-option">
+                        <input class="form-check-input" type="radio" name="paymentMethod" id="creditCardBooking" value="CREDIT_CARD" checked>
+                        <label class="form-check-label" for="creditCardBooking">
+                            <i class="fas fa-credit-card me-2"></i>Credit Card
+                        </label>
+                    </div>
+                    <div class="form-check payment-option">
+                        <input class="form-check-input" type="radio" name="paymentMethod" id="debitCardBooking" value="DEBIT_CARD">
+                        <label class="form-check-label" for="debitCardBooking">
+                            <i class="fas fa-money-check-alt me-2"></i>Debit Card
+                        </label>
+                    </div>
+                    <div class="form-check payment-option">
+                        <input class="form-check-input" type="radio" name="paymentMethod" id="digitalWalletBooking" value="DIGITAL_WALLET">
+                        <label class="form-check-label" for="digitalWalletBooking">
+                            <i class="fas fa-mobile-alt me-2"></i>Digital Wallet
+                        </label>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="payment-proof mb-4">
+                <h6 class="mb-3">
+                    <i class="fas fa-upload me-2"></i>Payment Proof (Optional)
+                </h6>
+                <div class="mb-3">
+                    <input type="file" class="form-control" id="paymentProofFileBooking" accept="image/*">
+                    <div class="form-text">Upload payment receipt or proof (JPG, PNG, max 5MB)</div>
+                </div>
+            </div>
+            
+            <div class="payment-terms">
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="agreeTermsBooking" required>
+                    <label class="form-check-label" for="agreeTermsBooking">
+                        I confirm that this payment is for Booking #${booking.id} and agree to the <a href="/terms" target="_blank">Terms and Conditions</a>
+                    </label>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    // Store current booking for payment
+    window.currentPaymentBooking = booking;
+    
+    // Show modal
+    const modal = new bootstrap.Modal(elements.paymentCompletionModal);
+    modal.show();
+    
+    // Setup payment submission and coupon listeners
+    setupPaymentCompletionListeners();
+    setupCouponListenersBooking(booking); // NEW: Setup coupon listeners
+}
+
+// NEW: Setup coupon application listeners for bookings
+function setupCouponListenersBooking(booking) {
+    const applyCouponBtn = document.getElementById('applyCouponBtnBooking');
+    const couponCodeInput = document.getElementById('couponCodeBooking');
+    const couponStatus = document.getElementById('couponStatusBooking');
+    
+    // Initialize amounts
+    originalAmountBooking = booking.total_price || 0;
+    finalAmountBooking = originalAmountBooking;
+    
+    if (applyCouponBtn) {
+        applyCouponBtn.onclick = async function() {
+            await applyCouponBooking();
+        };
+    }
+    
+    // Allow applying coupon with Enter key
+    if (couponCodeInput) {
+        couponCodeInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                applyCouponBooking();
+            }
+        });
+    }
+}
+
+// NEW: Apply coupon function for bookings
+async function applyCouponBooking() {
+    const couponCodeInput = document.getElementById('couponCodeBooking');
+    const applyCouponBtn = document.getElementById('applyCouponBtnBooking');
+    const couponStatus = document.getElementById('couponStatusBooking');
+    
+    if (!couponCodeInput || !applyCouponBtn || !couponStatus) {
+        console.error('Coupon elements not found');
+        return;
+    }
+    
+    const couponCode = couponCodeInput.value.trim();
+    
+    if (!couponCode) {
+        showCouponStatusBooking('Please enter a coupon code', 'error');
+        return;
+    }
+    
+    try {
+        // Show loading state
+        applyCouponBtn.disabled = true;
+        applyCouponBtn.innerHTML = `
+            <span class="spinner-border spinner-border-sm me-2" role="status"></span>
+            Applying...
+        `;
+        
+        // Call GraphQL mutation to use coupon
+        const result = await AuthService.graphqlRequest(`
+            mutation {
+                useCoupon(code: "${couponCode}", bookingAmount: ${originalAmountBooking}) {
+                    success
+                    message
+                    discountAmount
+                }
+            }
+        `, {}, true);
+        
+        if (result.data?.useCoupon?.success) {
+            // Successfully applied coupon
+            appliedCouponBooking = {
+                code: couponCode,
+                discountAmount: result.data.useCoupon.discountAmount,
+                message: result.data.useCoupon.message
+            };
+            
+            discountAmountBooking = result.data.useCoupon.discountAmount;
+            finalAmountBooking = originalAmountBooking - discountAmountBooking;
+            
+            // Update UI
+            updatePaymentAmountsBooking();
+            showCouponStatusBooking(result.data.useCoupon.message, 'success');
+            
+            // Disable input and button after successful application
+            couponCodeInput.disabled = true;
+            applyCouponBtn.innerHTML = `<i class="fas fa-check me-2"></i>Applied`;
+            applyCouponBtn.classList.remove('btn-outline-primary');
+            applyCouponBtn.classList.add('btn-success');
+            
+            // Add remove coupon button
+            addRemoveCouponButtonBooking();
+            
+        } else {
+            // Failed to apply coupon
+            showCouponStatusBooking(result.data?.useCoupon?.message || 'Failed to apply coupon', 'error');
+        }
+        
+    } catch (error) {
+        console.error('Error applying coupon:', error);
+        showCouponStatusBooking('Error applying coupon. Please try again.', 'error');
+    } finally {
+        // Reset button if not successful
+        if (!appliedCouponBooking) {
+            applyCouponBtn.disabled = false;
+            applyCouponBtn.innerHTML = `<i class="fas fa-tag me-2"></i>Apply Coupon`;
+        }
+    }
+}
+
+// NEW: Update payment amounts in UI for bookings
+function updatePaymentAmountsBooking() {
+    const originalAmountEl = document.getElementById('original-amount-booking');
+    const discountInfoEl = document.getElementById('discount-info-booking');
+    const discountValueEl = document.getElementById('discount-value-booking');
+    const finalTotalEl = document.getElementById('final-total-booking');
+    
+    if (originalAmountEl) {
+        originalAmountEl.textContent = `$${originalAmountBooking.toFixed(2)}`;
+    }
+    
+    if (discountAmountBooking > 0) {
+        if (discountInfoEl) {
+            discountInfoEl.style.display = 'block';
+        }
+        if (discountValueEl) {
+            discountValueEl.textContent = `-$${discountAmountBooking.toFixed(2)}`;
+        }
+    } else {
+        if (discountInfoEl) {
+            discountInfoEl.style.display = 'none';
+        }
+    }
+    
+    if (finalTotalEl) {
+        finalTotalEl.textContent = `$${finalAmountBooking.toFixed(2)}`;
+        // Update current payment booking data
+        if (window.currentPaymentBooking) {
+            window.currentPaymentBooking.finalAmount = finalAmountBooking;
+            window.currentPaymentBooking.appliedCoupon = appliedCouponBooking;
+        }
+    }
+}
+
+// NEW: Show coupon status message for bookings
+function showCouponStatusBooking(message, type) {
+    const couponStatus = document.getElementById('couponStatusBooking');
+    if (!couponStatus) return;
+    
+    couponStatus.style.display = 'block';
+    couponStatus.className = `coupon-status mt-2 alert alert-${type === 'success' ? 'success' : 'danger'}`;
+    couponStatus.innerHTML = `
+        <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'} me-2"></i>
+        ${message}
+    `;
+    
+    // Auto-hide error messages after 5 seconds
+    if (type === 'error') {
+        setTimeout(() => {
+            couponStatus.style.display = 'none';
+        }, 5000);
+    }
+}
+
+// NEW: Add remove coupon button for bookings
+function addRemoveCouponButtonBooking() {
+    const couponInputGroup = document.querySelector('#paymentCompletionModal .coupon-input-group .row .col-md-4');
+    if (couponInputGroup) {
+        couponInputGroup.innerHTML += `
+            <button type="button" class="btn btn-outline-danger w-100 mt-2" id="removeCouponBtnBooking">
+                <i class="fas fa-times me-2"></i>Remove Coupon
+            </button>
+        `;
+        
+        // Setup remove coupon listener
+        const removeCouponBtn = document.getElementById('removeCouponBtnBooking');
+        if (removeCouponBtn) {
+            removeCouponBtn.onclick = function() {
+                removeCouponBooking();
+            };
+        }
+    }
+}
+
+// NEW: Remove applied coupon for bookings
+function removeCouponBooking() {
+    const couponCodeInput = document.getElementById('couponCodeBooking');
+    const applyCouponBtn = document.getElementById('applyCouponBtnBooking');
+    const couponStatus = document.getElementById('couponStatusBooking');
+    const removeCouponBtn = document.getElementById('removeCouponBtnBooking');
+    
+    // Reset coupon data
+    appliedCouponBooking = null;
+    discountAmountBooking = 0;
+    finalAmountBooking = originalAmountBooking;
+    
+    // Reset UI
+    if (couponCodeInput) {
+        couponCodeInput.value = '';
+        couponCodeInput.disabled = false;
+    }
+    
+    if (applyCouponBtn) {
+        applyCouponBtn.disabled = false;
+        applyCouponBtn.innerHTML = `<i class="fas fa-tag me-2"></i>Apply Coupon`;
+        applyCouponBtn.classList.remove('btn-success');
+        applyCouponBtn.classList.add('btn-outline-primary');
+    }
+    
+    if (removeCouponBtn) {
+        removeCouponBtn.remove();
+    }
+    
+    if (couponStatus) {
+        couponStatus.style.display = 'none';
+    }
+    
+    // Update amounts
+    updatePaymentAmountsBooking();
 }
 
 // Global functions for inline event handlers
