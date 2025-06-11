@@ -1578,24 +1578,24 @@ async function processBookingPayment() {
             Processing Payment...
         `;
         
-        // Use final amount (after coupon discount) for payment
+        // UPDATED: Use final amount (after coupon discount) for payment
         const amountToPay = finalAmountBooking || booking.total_price || 0;
         
-        console.log('Payment Details:', {
+        console.log('Payment Details with Coupon Support:', {
             bookingId: booking.id,
-            originalAmount: originalAmountBooking,
-            discountAmount: discountAmountBooking,
+            originalAmount: originalAmountBooking || booking.total_price,
+            discountAmount: discountAmountBooking || 0,
             finalAmount: amountToPay,
             appliedCoupon: appliedCouponBooking,
             paymentMethod: selectedPaymentMethod.value
         });
         
-        // Create payment via GraphQL mutation
+        // Create payment via GraphQL mutation with final amount
         const paymentResult = await createPaymentForBooking(
             booking.id,
             selectedPaymentMethod.value,
             paymentProofImage,
-            amountToPay  // Pass the discounted amount
+            amountToPay  // IMPORTANT: Pass the discounted amount
         );
         
         if (paymentResult.success) {
@@ -1630,11 +1630,14 @@ async function processBookingPayment() {
             
             // Show success message with coupon info
             let successMessage = 'Payment successful! Your booking has been confirmed.';
-            if (appliedCouponBooking) {
-                successMessage += ` Coupon "${appliedCouponBooking.code}" applied with $${discountAmountBooking.toFixed(2)} discount.`;
+            if (appliedCouponBooking && discountAmountBooking > 0) {
+                successMessage += ` Coupon "${appliedCouponBooking.code}" applied - You saved $${discountAmountBooking.toFixed(2)}!`;
             }
             
             AuthService.showMessage(successMessage, 'success');
+            
+            // Log final payment amount
+            console.log(`💰 Final payment amount stored in database: $${amountToPay.toFixed(2)}`);
             
             // Reload bookings data to show updated status
             setTimeout(() => {
@@ -1657,14 +1660,15 @@ async function processBookingPayment() {
     }
 }
 
-async function createPaymentForBooking(bookingId, paymentMethod, paymentProofImage = null, customAmount = null) {
+async function createPaymentForBooking(bookingId, paymentMethod, paymentProofImage = null, finalAmount = null) {
     try {
         const mutation = `
-            mutation CreatePayment($bookingId: Int!, $paymentMethod: String!, $paymentProofImage: String) {
+            mutation CreatePayment($bookingId: Int!, $paymentMethod: String!, $paymentProofImage: String, $finalAmount: Float) {
                 createPayment(
                     bookingId: $bookingId, 
                     paymentMethod: $paymentMethod, 
-                    paymentProofImage: $paymentProofImage
+                    paymentProofImage: $paymentProofImage,
+                    finalAmount: $finalAmount
                 ) {
                     payment {
                         id
@@ -1693,11 +1697,12 @@ async function createPaymentForBooking(bookingId, paymentMethod, paymentProofIma
         const variables = {
             bookingId: parseInt(bookingId),
             paymentMethod: paymentMethod,
-            paymentProofImage: paymentProofImage
+            paymentProofImage: paymentProofImage,
+            finalAmount: finalAmount  // ADDED: Pass final amount after discount
         };
         
-        console.log('Creating payment with variables:', variables);
-        console.log('Expected amount after discount:', customAmount);
+        console.log('Creating payment for booking with variables:', variables);
+        console.log('Final amount after coupon discount:', finalAmount);
         
         const result = await AuthService.graphqlRequest(mutation, variables, true);
         
@@ -1711,6 +1716,13 @@ async function createPaymentForBooking(bookingId, paymentMethod, paymentProofIma
         
         if (result.data?.createPayment) {
             console.log('Payment created successfully:', result.data.createPayment);
+            
+            // Log discount information if applied
+            if (finalAmount && originalAmountBooking && finalAmount < originalAmountBooking) {
+                const discountAmount = originalAmountBooking - finalAmount;
+                console.log(`✅ Payment completed with discount: Original $${originalAmountBooking.toFixed(2)} -> Final $${finalAmount.toFixed(2)} (Saved $${discountAmount.toFixed(2)})`);
+            }
+            
             return {
                 success: result.data.createPayment.success,
                 payment: result.data.createPayment.payment,

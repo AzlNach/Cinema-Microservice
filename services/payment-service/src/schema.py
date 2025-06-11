@@ -98,54 +98,54 @@ class CreatePaymentResponse(ObjectType):
 
 class CreatePayment(Mutation):
     class Arguments:
-        userId = Int(required=True)
-        bookingId = Int(required=True)
-        amount = Float(required=True)
-        paymentMethod = String()
-        paymentProofImage = String()
+        user_id = Int(required=True)
+        booking_id = Int(required=True)
+        amount = Float(required=True)  # CHANGED: This will be final amount after discount
+        payment_method = String(required=True)
+        payment_proof_image = String()
 
     Output = CreatePaymentResponse
 
-    def mutate(self, info, userId, bookingId, amount, paymentMethod='CREDIT_CARD', paymentProofImage=None):
+    def mutate(self, info, user_id, booking_id, amount, payment_method, payment_proof_image=None):
         try:
+            print(f"DEBUG: Creating payment - user_id: {user_id}, booking_id: {booking_id}, amount: {amount}")
+            
             # Check if payment already exists for this booking
-            existing_payment = Payment.get_by_booking(bookingId)
+            existing_payment = Payment.query.filter_by(booking_id=booking_id).first()
             if existing_payment:
                 return CreatePaymentResponse(
                     payment=None,
                     success=False,
-                    message=f"Payment already exists for booking {bookingId}"
+                    message="Payment already exists for this booking"
                 )
-            
-            # Create payment with proper field mapping
+
+            # UPDATED: Use the provided amount directly (this is already the final amount after discount)
+            final_amount = float(amount)
+            print(f"DEBUG: Final amount to be stored: {final_amount}")
+
+            # Create payment with the final amount
             payment = Payment(
-                user_id=userId,           # Map camelCase to snake_case
-                booking_id=bookingId,     # Map camelCase to snake_case
-                amount=amount,
-                payment_method=paymentMethod,     # Map camelCase to snake_case
-                payment_proof_image=paymentProofImage  # Map camelCase to snake_case
+                user_id=user_id,
+                booking_id=booking_id,
+                amount=final_amount,  # Store the discounted amount
+                payment_method=payment_method,
+                status='PAID',  # Set as paid immediately for demo
+                payment_proof_image=payment_proof_image,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
             )
             
-            if payment.save():
-                # Debug: Print payment data before returning
-                print(f"Created payment: id={payment.id}, user_id={payment.user_id}, booking_id={payment.booking_id}")
-                print(f"Payment object attributes: {vars(payment)}")
-                
-                return CreatePaymentResponse(
-                    payment=payment,
-                    success=True,
-                    message="Payment created successfully"
-                )
-            else:
-                return CreatePaymentResponse(
-                    payment=None,
-                    success=False,
-                    message="Failed to save payment"
-                )
-                
+            payment.save()
+            print(f"DEBUG: Payment created successfully with ID: {payment.id}, Amount: {payment.amount}")
+
+            return CreatePaymentResponse(
+                payment=payment,
+                success=True,
+                message=f"Payment of ${final_amount:.2f} created successfully"
+            )
         except Exception as e:
             db.session.rollback()
-            print(f"Error creating payment: {str(e)}")
+            print(f"DEBUG: Error creating payment: {str(e)}")
             traceback.print_exc()
             return CreatePaymentResponse(
                 payment=None,

@@ -3140,11 +3140,12 @@ class CreatePayment(Mutation):
         bookingId = Int(required=True)
         paymentMethod = String()
         paymentProofImage = String()
+        finalAmount = Float()  # NEW: Optional parameter for final amount (after coupon discount)
 
     Output = CreatePaymentResponse
 
     @require_auth
-    def mutate(self, info, current_user, bookingId, paymentMethod='CREDIT_CARD', paymentProofImage=None):
+    def mutate(self, info, current_user, bookingId, paymentMethod='CREDIT_CARD', paymentProofImage=None, finalAmount=None):
         # Step 1: Validate booking exists and get booking details
         booking_check_query = {
             'query': f'''
@@ -3263,9 +3264,30 @@ class CreatePayment(Mutation):
         seat_count = len(reserved_seats)
         calculated_amount = showtime_price * seat_count
         
+        # NEW: Use finalAmount if provided (after coupon discount), otherwise use calculated amount
+        original_amount = calculated_amount
+        payment_amount = finalAmount if finalAmount is not None else calculated_amount
+        
         print(f"Payment calculation: {seat_count} seats × {showtime_price} = {calculated_amount}")  # Debug log
+        print(f"Original amount: {original_amount}")
+        print(f"Final payment amount (after coupon): {payment_amount}")
+        
+        # NEW: Validate that final amount is not negative or greater than original
+        if payment_amount < 0:
+            return CreatePaymentResponse(
+                payment=None,
+                success=False,
+                message="Payment amount cannot be negative"
+            )
+        
+        if payment_amount > original_amount:
+            return CreatePaymentResponse(
+                payment=None,
+                success=False,
+                message="Payment amount cannot exceed original booking amount"
+            )
 
-        # Step 5: Create payment with calculated amount (status starts as 'pending')
+        # Step 5: Create payment with final amount (status starts as 'pending')
         payment_query = {
             'query': '''
             mutation($amount: Float!, $userId: Int!, $bookingId: Int!, $paymentMethod: String!, $paymentProofImage: String) {
@@ -3287,7 +3309,7 @@ class CreatePayment(Mutation):
             }
             ''',
             'variables': {
-                'amount': calculated_amount,
+                'amount': payment_amount,  # NEW: Use final amount after discount
                 'userId': current_user['user_id'],
                 'bookingId': bookingId,
                 'paymentMethod': paymentMethod,
@@ -3420,11 +3442,16 @@ class CreatePayment(Mutation):
         
         # Step 9: Transform payment data with success confirmation
         if payment_service_data:
+            # NEW: Log discount information if applied
+            if finalAmount and original_amount and finalAmount < original_amount:
+                discount_amount = original_amount - finalAmount
+                print(f"Payment completed with coupon discount - Original: ${original_amount:.2f}, Discount: ${discount_amount:.2f}, Final: ${finalAmount:.2f}")
+            
             transformed_payment = {
                 'id': payment_service_data.get('id'),
                 'userId': payment_service_data.get('userId') or current_user['user_id'],
                 'bookingId': payment_service_data.get('bookingId') or bookingId,
-                'amount': payment_service_data.get('amount') or calculated_amount,
+                'amount': payment_service_data.get('amount') or payment_amount,  # NEW: This is now the discounted amount
                 'paymentMethod': payment_service_data.get('paymentMethod') or paymentMethod,
                 'status': 'success',
                 'paymentProofImage': payment_service_data.get('paymentProofImage') or paymentProofImage,
